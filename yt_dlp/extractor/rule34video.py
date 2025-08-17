@@ -1,7 +1,7 @@
 import re
 
-from .common import InfoExtractor
-from ..utils import (
+from yt_dlp.extractor.common import InfoExtractor
+from yt_dlp.utils import (
     clean_html,
     extract_attributes,
     get_element_by_attribute,
@@ -12,8 +12,12 @@ from ..utils import (
     parse_count,
     parse_duration,
     unescapeHTML,
+    ExtractorError,
+    urlencode_postdata
 )
-from ..utils.traversal import traverse_obj
+from yt_dlp.extractor import generic
+from urllib.parse import urlparse, urlunparse
+from yt_dlp.utils.traversal import traverse_obj
 
 
 class Rule34VideoIE(InfoExtractor):
@@ -83,13 +87,15 @@ class Rule34VideoIE(InfoExtractor):
         categories, creators, uploader, uploader_url = [None] * 4
         for col in get_elements_by_class('col', webpage):
             label = clean_html(get_element_by_class('label', col))
-            if label == 'Categories:':
+            if label == 'Categories':
                 categories = list(map(clean_html, get_elements_by_class('item', col)))
-            elif label == 'Artist:':
+            elif label == 'Artist':
                 creators = list(map(clean_html, get_elements_by_class('item', col)))
-            elif label == 'Uploaded By:':
-                uploader = clean_html(get_element_by_class('name', col))
-                uploader_url = extract_attributes(get_element_html_by_class('name', col) or '').get('href')
+            elif label == 'Uploaded by':
+                # Find the anchor tag for the uploader name
+                uploader_anchor = get_element_html_by_class('item btn_link', col) or ''
+                uploader = clean_html(uploader_anchor)
+                uploader_url = extract_attributes(uploader_anchor).get('href')
 
         return {
             **traverse_obj(self._search_json_ld(webpage, video_id, default={}), ({
@@ -121,3 +127,80 @@ class Rule34VideoIE(InfoExtractor):
             'tags': list(map(unescapeHTML, re.findall(
                 r'<a class="tag_item"[^>]+\bhref="https://rule34video\.com/tags/\d+/"[^>]*>(?P<tag>[^>]*)</a>', webpage))),
         }
+
+class Rule34VideoUserIE(InfoExtractor):
+    IE_NAME = 'rule34video:user'
+    _VALID_URL = r'https?://(?:www\.)?rule34video\.com/members/(?P<id>\d+)(?:/(?:videos|favourites/videos|playlists)/?)?'
+
+    _TESTS = [{
+        'url': 'https://rule34video.com/members/1613548/',
+        'info_dict': {
+            'id': '1613548',
+            'title': 'EchobunnyMV',
+            'uploader_id': '1613548',
+            'uploader': 'EchobunnyMV',
+            'description': str,
+            'thumbnails': list,
+        },
+        'playlist_mincount': 10,
+        'params': {'skip_download': True},
+    }]
+
+    def _fetch_page(self, user_id, display_id, page):
+        # The site accepts both '2' and '02' so zero-pad to match their markup
+        page_param = f'{page:02d}'
+        ajax_url = (
+            f'https://rule34video.com/members/{user_id}/videos/'
+            f'?mode=async&function=get_block&block_id=list_videos_uploaded_videos'
+            f'&sort_by=&from_videos={page_param}'
+        )
+        html = self._download_webpage(
+            ajax_url, display_id, note=f'Downloading user videos page {page}', fatal=False) or ''
+
+        for m in re.finditer(
+            r'<a\s+class="th[^"]*"\s+href="(?P<href>https?://rule34video\.com/video/\d+/[^"]+)"',
+            html):
+            yield self.url_result(m.group('href'), ie=Rule34VideoIE.ie_key())
+
+        has_next = re.search(
+            rf'data-parameters="[^"]*from_videos:(?:{page+1:02d}|{page+1})[^"]*"', html)
+        if has_next:
+            yield None 
+
+    def _real_extract(self, url):
+        user_id = self._match_id(url)
+
+        profile_url = f'https://rule34video.com/members/{user_id}/'
+        profile = self._download_webpage(profile_url, user_id)
+
+        name = (self._html_search_regex(r'<h2 class="title">\s*(.*?)\s*</h2>', profile, 'name', default=None)
+                or self._html_search_regex(r'<title>([^<]+?)\'s Page</title>', profile, 'title', default=None))
+
+        avatar = self._search_regex(
+            r'<div class="avatar">\s*<img[^>]+src="([^"]+)"',
+            profile, 'avatar', default=None)
+
+        about = clean_html(self._search_regex(
+            r'<div class="bottom_description">[\s\S]*?<div class="row">([\s\S]*?)</div>',
+            profile, 'about', default=''))
+
+        entries, page = [], 1
+        while True:
+            saw_items = False
+            for item in self._fetch_page(user_id, user_id, page):
+                if item is None:
+                    continue
+                entries.append(item)
+                saw_items = True
+            if not saw_items:
+                break
+            page += 1
+
+        playlist = self.playlist_result(entries, playlist_id=user_id, playlist_title=name)
+        if avatar:
+            playlist['thumbnails'] = [{'url': avatar}]
+        if about:
+            playlist['description'] = about
+        playlist['uploader'] = name
+        playlist['uploader_id'] = user_id
+        return playlist
